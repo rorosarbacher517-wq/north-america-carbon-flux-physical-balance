@@ -1,0 +1,37 @@
+# Local credentials
+.netrc
+*.pem
+*.key
+*.token
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE/project-local state
+.idea/
+.vscode/
+
+# Large data and model/runtime outputs
+data/
+outputs/
+results/
+logs/
+*.npy
+*.npz
+*.h5
+*.hdf
+*.hdf5
+*.tif
+*.tiff
+*.vrt
+*.nc
+*.zip
+*.tar
+*.tar.gz
+
+# Training logs/checkpoints
+*.ckpt
+*.keras
+*.h5
+events.out.tfevents.*

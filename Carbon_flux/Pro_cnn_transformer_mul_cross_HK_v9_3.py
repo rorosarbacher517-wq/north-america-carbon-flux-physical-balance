@@ -1,0 +1,301 @@
+# 向数据中添加高植被指数 NDV1 EVI，来比较植被指数或光学指数的影响
+
+import importlib
+import pandas as pd
+import os
+import Data_preprocess
+import tensorflow as tf
+import numpy as np
+from sklearn.metrics import mean_squared_error, r2_score
+import time
+from keras import backend as K
+from statistics import mean
+import matplotlib.pyplot as plt
+from scipy.stats import gaussian_kde
+import Data_filter_match
+
+import myloss
+import other_process
+import importlib
+
+importlib.reload(myloss)
+importlib.reload(other_process)
+
+base_name = "test"
+if '__file__' in globals():
+    # base_name = os.path.basename(__file__)+socket.gethostname()
+    base_name = os.path.basename(__file__)[15:]
+
+
+def calculate_vegetation_indices(x_image_array):
+    """
+    计算 NDVI 和 EVI 并将其添加到原数组中，处理 -9999 的值。
+
+    参数：
+    x_image_array (numpy.ndarray): 输入的形状为 (1688, 365, 15, 3, 3) 的数组
+
+    返回：
+    numpy.ndarray: 新的形状为 (1688, 365, 17, 3, 3) 的数组，包含 NDVI 和 EVI
+    """
+
+    # 将 -9999 替换为 np.nan
+    x_image_array[x_image_array == -9999] = np.nan
+
+    # 计算 NDVI
+    NIR = x_image_array[:, :, 4]  # 第5个波段 (索引4)
+    Red = x_image_array[:, :, 3]  # 第4个波段 (索引3)
+
+    # 使用 np.nan 进行计算，避免数学上的问题
+    NDVI = (NIR - Red) / (NIR + Red)
+
+    # 计算 EVI
+    Blue = x_image_array[:, :, 2]  # 第3个波段 (索引2)
+    G = 2.5
+    C1 = 6
+    C2 = 7.5
+    L = 1
+
+    # 计算 EVI 并处理 np.nan
+    EVI = G * ((NIR - Red) / (NIR + C1 * Red - C2 * Blue + L))
+
+    # 增加维度以便与原数组相结合
+    NDVI = NDVI[:, :, np.newaxis, :, :]  # 形状变为 (1688, 365, 1, 3, 3)
+    EVI = EVI[:, :, np.newaxis, :, :]  # 形状变为 (1688, 365, 1, 3, 3)
+
+    # 初始化新数组，形状为 (1688, 365, 17, 3, 3)
+    new_x_image_array = np.empty((x_image_array.shape[0], x_image_array.shape[1], x_image_array.shape[2] + 2,
+                                  x_image_array.shape[3], x_image_array.shape[4]))
+
+    # 将原数组数据复制到新数组
+    new_x_image_array[:, :, :9, :, :] = x_image_array[:, :, :9, :, :]  # 前 9 个波段
+    new_x_image_array[:, :, 9:11, :, :] = np.concatenate((NDVI, EVI), axis=2)  # 将 NDVI 和 EVI 插入到第 9 个波段后
+
+    # 继续复制原数组后面的波段
+    new_x_image_array[:, :, 11:, :, :] = x_image_array[:, :, 9:, :, :]  # 后面的波段
+
+    # 处理计算后 NDVI 和 EVI 中的 np.nan 情况（如需替换或过滤）
+    new_x_image_array[np.isnan(new_x_image_array)] = -9999  # 替换 NaN 值为 -9999
+
+    return new_x_image_array
+
+# 给定影像的根路径
+if __name__ == "__main__":
+    EPOCH = 100
+    # EPOCH = 70
+    # LEARNING_RATE = 0.001 # 0.001(OK),0.0001,0.01,0.1,
+    LEARNING_RATE = 0.01
+    BATCH_SIZE = 16  #
+    L2 = 0.0001  # 0.0001(ok),0.00001,0.001,0.01
+
+    # EPOCH           =   int(sys.argv[1] )
+    # LEARNING_RATE   = float(sys.argv[2])
+    # BATCH_SIZE      =   int(sys.argv[3])
+    # L2              = float(sys.argv[4])
+
+    # download the data
+    base_name = base_name + ".epoch{:03d}.rate{:.5f}.batch{:03d}.L{:.5f}".format(EPOCH, LEARNING_RATE, BATCH_SIZE, L2)
+    inputdata_path = './data/sites_input/'
+
+    x_ref_array = np.load(inputdata_path + 'x_ref_modis_interpolation_mark.npy',
+                          allow_pickle=True)  # the dimension 15 indicate whether to interpolate
+    # 15 bands: 0-6 reflectance; 7-13 QA; 14 is interpolation indication (0 is measrued and 1 is interpolated)
+    x_lai_array = np.load(inputdata_path + 'x_lai_modis_interpolation_mark.npy',
+                          allow_pickle=True)  # 4 bands: 2 bands for LAI, fpar; 1 band QA; 1 band interpolation indication
+    x_mete_array = np.load(inputdata_path + 'x_mete_era5_interpolation_mark.npy',
+                           allow_pickle=True)  # ERA 5 meteorological 7 bands; 0-5 meteorological; 6  interpolation indication
+    y_image_array_all = np.load(inputdata_path + 'y_flux_meteorological_mark.npy', allow_pickle=True)
+    y_qa_array_all = np.load(inputdata_path + 'All_sites_y_qa.npy', allow_pickle=True)
+    x_image_array_all = np.concatenate(
+        (x_ref_array[..., :-1, :, :], x_lai_array[..., :-1, :, :], x_mete_array[..., :-1, :, :]),
+        axis=2)  # 23 bands all but not including interpolation indication
+    x_inter_mask_all = np.concatenate(
+        (x_ref_array[..., -1:, :, :], x_lai_array[..., -1:, :, :], x_mete_array[..., -1:, :, :]),
+        axis=2)  # 3 interpolation indication
+    ##### 匹配前检查同一像素不同波段值缺失的情况
+    # inputdata_path = './data/sites_results/'
+    # x_image_array_all = np.load(inputdata_path + 'DL_RLM_predict_3.npy', allow_pickle=True)
+    # y_image_array_all = np.load(inputdata_path + 'DL_RLM_true_3.npy', allow_pickle=True)
+    # # y_image_array_all = np.load(inputdata_path + 'DL_RLM_sites_3.npy', allow_pickle=True)
+    # x_inter_mask_all = np.load(inputdata_path + 'DL_RLM_x_mask_3.npy', allow_pickle=True)
+    # y_qa_array_all = np.load(inputdata_path + 'DL_RLM_y_qa_3.npy', allow_pickle=True)
+
+    # 将y_image_array_all进行特征填充
+    # x_image_array is 7 reflectance + 2 lai/fpar + 6 ERA5 ()
+    x_image_array, y_image_array, x_inter_mask_array0, y_qa_array = Data_filter_match.mul_match_x_y_modis_quality(
+        x_image_array_all,
+        y_image_array_all,
+        x_inter_mask_all,
+        y_qa_array_all,
+        ref=True, lai=True,
+        meteorology=False,  # flux site meteorology
+        era5_meteorology=True,  # era5 meteorology
+        NEE_GPP_RECO=True,
+        ref_quality=0,
+        ref_filledvalue=0,
+        lai_filledvalue=0,
+        lai_quality=0,
+        era5_mete_filledvalue=0,
+        meteorology_filledvalue=0,
+        NEE_GPP_RECO_filledvalue=0,is_inter=0)
+    print(x_image_array.shape, y_image_array.shape)
+    x_inter_mask_array = other_process.full_intervalue(x_inter_mask_array0)
+    y_flux_qa_array = y_qa_array[:, :, -5:]
+    x_image_array[:, :, 0, 0, 1]
+    y_image_array[:,:, 7]
+    x_inter_mask_array[203, :, :, 0, 1]
+    y_flux_qa_array[:,:,3]
+    # 将交叉验证的结果保存下来进行验证分析
+    # results_variation_path = './data/sites_sensitivity/'
+    results_variation_path = './data/sites_results/'
+    if not os.path.isdir(results_variation_path):
+        # 创建文件夹
+        os.makedirs(results_variation_path)
+        print(f"已创建文件夹：{results_variation_path}")
+    np.save(results_variation_path + 'DL_RL_x_mask_indicators_1.npy', x_inter_mask_array)
+    np.save(results_variation_path + 'DL_RL_y_qa_indicators_1.npy',y_flux_qa_array)  # y_flux_qa_array.shape (1688, 365, 5), the fouth dimension is QA
+    # 将质量标识的波段去除
+    # x_image_array = x_image_array[:,:,[0,1,2,3,4,5,6,14,16,17,18,19,20,21,22],:,:]
+    covariate_array = y_image_array[:, :, [4, 9, 10, 11, 12, 3, 5, 16, 17, 18, 19, 20, 21, 22]]
+    other_process.check_dim_fill(x_image_array)
+    other_process.y_statistic_df(y_image_array)
+    # 得到三组数据 分别用
+    # 将covariate_array中的植被类型（新array中的第8列）和气候类型（新array中的第8列）换成离散数字表示，因为字符串类型计算不了均值等统计值
+    covariate_array = other_process.replace_veg_cli(covariate_array)
+
+    # 根据modis 几个波段的数据计算光学植被指数
+    new_array = calculate_vegetation_indices(x_image_array)
+    new_array[:,:,15,1,1]
+    # # k倍交叉验证划分数据集
+    cross_validation_data = Data_preprocess.get_cross_validation_training_test(new_array, y_image_array,
+                                                                               covariate_array)
+    # print(cross_validation_data) # # 统计输入模型的数据-9999所占的比例
+    # loss = mask_loss(maskValue=-9999)
+    importlib.reload(myloss)
+    # loss = myloss.mask_loss(maskValue=-9999) # for multiple/single variable without physics
+    loss = myloss.mask_loss_physical(maskValue=-9999) # for multiple variable with physics
+    # loss = myloss.mask_loss_huber(maskValue=-9999)  # for multiple variable with physics
+    # loss = myloss.mask_loss_physical_MAE(maskValue=-9999) # for multiple variable with physics
+    METHOD = 2  # 2(OK),0,1
+
+    # IS_TEST = 1
+    # ITERS = 5
+    print('Data is ready!')
+    Y_pred_filtered = []
+    Y_test_filtered = []
+    Y_test_sites = []
+    Rmse = []
+    R2 = []
+    CC = []
+    Bias = []
+    N = []
+    # stacked_array = None
+    # import Model_build_copy
+    import Model_build
+
+    # importlib.reload(Model_build_copy)
+    importlib.reload(Model_build)
+    import Model_history
+
+    importlib.reload(Model_history)
+    # print(input_images_test_norm3)
+    # layer_cnn=3,2(0k);layern=2,3;units=32(ok),64,16;n_head=6,5(ok),4,3;drop=0.001(ok),0.0001,0.00001,0.01,0.1;doy_encoder=2,0(ok),1
+    # doy_encoder=0;
+    doy_encoder = 2;
+    # drop = 0.1; units=64
+    drop = 0.1;
+    # units = 32（ok）
+    # units = 64  # _3 RLFM
+    units = 32 # _4 没有气象变量 # 单独预测的NEE GPP RECO
+    # y_SCALE = 0.1
+    y_SCALE = 1
+    # drop = 0.001;
+    # 依次遍历划分好的训练集和测试集
+    # ik = 0; kth_data = cross_validation_data[ik]
+    for ik, kth_data in enumerate(cross_validation_data):
+        # index_train, index_test, trainx, trainy, testx, testy, train_covariate, test_covariate, train_sites_counts, test_sites_counts, RF_trainy, RF_testy = cross_validation_data
+        trainx, trainy, testx, testy, train_covariate, test_covariate, train_sites_counts, test_sites_counts, test_sites_array = (
+            kth_data['trainx'], kth_data['trainy'], kth_data['testx'], kth_data['testy'],
+            kth_data['train_covariate'], kth_data['test_covariate'], kth_data['train_sites_counts'],
+            kth_data['test_sites_counts'], kth_data['test_array'])
+
+        trainy = trainy[:, :, :].reshape(trainy.shape[0], trainy.shape[1], 3)
+        trainy[trainy != -9999.0] = trainy[trainy != -9999.0] * y_SCALE  # added by Hank
+        testy = testy[:, :, :].reshape(testy.shape[0], testy.shape[1], 3)
+        # 单个变量做训练
+        trainy = trainy[:, :, :]
+        testy = testy[:, :, :]
+        # ## 对训练集和测试集的影像数据和其他协变量进行标准化
+        input_images_train_norm0, input_images_test_norm0, input_covariate_train_norm0, input_covariate_test_norm0, mean_train, std_train, mean_train_cov, std_train_cov = Data_preprocess.construct_composite_train_test(
+            trainx, testx, train_covariate, test_covariate, is_train_test_com=True, is_single_norm=True)
+
+        ### 向数据集中添加噪声
+
+        # # # 对输入的像素数据进行填充值处理 全为-9999的保持为-9999，部分为-9999的填为0
+        # input_images_train_norm0 = other_process.process_pixel_values(input_images_train_norm0)
+        # input_images_test_norm0 = other_process.process_pixel_values(input_images_test_norm0)
+        # 仅选取MODIS 太阳辐射 和 空气温度
+        input_images_train_norm0 = other_process.process_pixel_values(input_images_train_norm0[:, :, :, :, :])
+        input_images_test_norm0 = other_process.process_pixel_values(input_images_test_norm0[:, :, :, :, :])
+        # 复制数据 变换维度
+        input_images_train_norm3 = np.transpose(input_images_train_norm0, (0, 1, 3, 4, 2))
+        input_images_test_norm3 = np.transpose(input_images_test_norm0, (0, 1, 3, 4, 2))
+        input_images_pre_norm3 = input_images_test_norm3
+        train_n = input_images_train_norm3.shape[0]
+        per_epoch = train_n // BATCH_SIZE
+        start = time.time()
+        # model = Model_build.get_transformer_cnn(layer_cnn=2, layern=2, units=units,
+        # n_times=input_images_train_norm3.shape[1],
+        # n_bands=input_images_train_norm3.shape[4], n_window=3, n_head=4, drop=drop, n_out=3,
+        # n_features=14, is_batch=True, mask_value=-9999,
+        # is_zero_fill=True, doy_encoder=doy_encoder,
+        # is_rptv=False, is_sensor=False)
+        importlib.reload(Model_build)
+        # model = Model_build.get_transformer_cnn2(layer_cnn=1, layern=2, units=units, n_times=input_images_train_norm3.shape[1],
+        #                 n_window=3,n_head=4, drop=drop,n_out=3, is_batch=True, mask_value=-9999.0, is_rptv=False,is_sensor=False)
+        # (layer_cnn=1, layern=2, units=64, n_times=80,MODIS_BANDS_N = 9, METER_BANDS_N = 6, n_window=3, n_head=4, drop=0.1, n_out=1,is_batch=True, mask_value=-9999.0, is_rptv=False, is_sensor=False)
+
+        model = Model_build.get_transformer_cnn2(layer_cnn=0, layern=3, units=units,
+                                                 n_times=input_images_train_norm3.shape[1],
+                                                 n_window=3, n_head=4, drop=drop, n_out=3, is_batch=True,
+                                                 mask_value=-9999.0, is_rptv=False, is_sensor=False)
+        if ik == 0:
+            print(model.summary())  # 输出模型各层的参数状况
+        print("**************************process" + str(ik + 1) + "th*********************************")
+        input_images_train_norm3 = np.array(input_images_train_norm3)
+        input_covariate_train_norm3 = np.array(input_covariate_train_norm0)
+        # model_history = Model_history.my_train_1schedule(model, input_images_train_norm3[:, :, :, :, :],
+        # trainy,
+        # epochs=EPOCH, start_rate=LEARNING_RATE,
+        # loss=loss, per_epoch=per_epoch, split_epoch=5,
+        # option=METHOD, decay=L2, batch_size=BATCH_SIZE,
+        # validation_split=0.04, hold_epoch=0, reduce_epoch=False)
+        model_history = Model_history.my_train_1schedule_time_drop(model, input_images_train_norm3, trainy,
+                                                                   epochs=EPOCH, start_rate=LEARNING_RATE, loss=loss,
+                                                                   per_epoch=per_epoch, split_epoch=5,
+                                                                   option=METHOD, decay=L2, batch_size=BATCH_SIZE,
+                                                                   validation_split=0.04, hold_epoch=0,
+                                                                   reduce_epoch=False, gaps_p=0.1)
+        # 每一折都保存模型，模型名后面加第几折的后缀
+        # 保存当前模型，模型名后面加上 epoch 编号
+        # model_pre_name = f'./region model/get_cnn_transformer_RLM_epoch_{ik + 1}.h5'
+        # model.save(model_pre_name)
+        input_images_test_norm3 = np.array(input_images_test_norm3)
+        input_covariate_test_norm3 = np.array(input_covariate_test_norm0)
+        input_images_test_norm3 = tf.convert_to_tensor(input_images_test_norm3, dtype=tf.float32)
+        input_covariate_test_norm3 = tf.convert_to_tensor(input_covariate_test_norm3, dtype=tf.float32)
+        # test_datasetx = [input_images_test_norm3, input_covariate_test_norm3]
+        # y_pred_filtered = model.predict(test_datasetx, verbose=2) / y_SCALE
+        y_pred_filtered = model.predict(input_images_test_norm3, verbose=2) / y_SCALE
+
+        # 将testy转换为float类型
+        y_test_filtered = np.array(testy, dtype='float')
+        Y_test_filtered.append(y_test_filtered)
+        Y_pred_filtered.append(y_pred_filtered)
+        Y_test_sites.append(test_sites_array)
+
+    Y_pred_filtered_array = np.concatenate(Y_pred_filtered, axis=0)
+    Y_test_filtered_array = np.concatenate(Y_test_filtered, axis=0)
+    Y_test_sites_array = np.concatenate(Y_test_sites, axis=0)
+    np.save(results_variation_path + 'DL_RL_predict_indicators_1.npy', Y_pred_filtered_array)
+    np.save(results_variation_path + 'DL_RL_true_indicators_1.npy', Y_test_filtered_array)
+    np.save(results_variation_path + 'DL_RL_sites_indicators_1.npy', Y_test_sites_array)
