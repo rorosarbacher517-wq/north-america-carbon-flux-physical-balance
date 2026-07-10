@@ -49,7 +49,7 @@ NEE + GPP - RECO ~= 0
 
 ## Main dependencies
 
-代码依赖按脚本导入大致包括：
+代码依赖按脚本导入包括：
 
 - Core scientific stack: `numpy`, `pandas`, `scipy`, `matplotlib`, `seaborn`, `scikit-learn`
 - Deep learning: `tensorflow`, `keras`, `tensorflow_addons`
