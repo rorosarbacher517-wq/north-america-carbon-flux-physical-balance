@@ -1,14 +1,14 @@
 # North America Carbon Flux Physical-Balance Code
 
-这个目录整理自 `E:\The North America ecosystem carbon flux\Code`，用于保存北美生态系统碳通量估算中与遥感数据处理、气象数据准备、通量站点匹配、机器学习建模和碳通量物理平衡约束相关的代码。
+这个目录用于保存北美生态系统碳通量估算中与遥感数据处理、气象数据准备、通量站点匹配、机器学习建模和碳通量物理平衡约束相关的代码。
 
-整理原则：保留原始代码文件名和文件内容，只把适合进入 GitHub 的轻量源码、配置、说明和小型 CSV 表格复制进来。原始目录中的大体积中间数据、模型输入输出、缓存、IDE 状态和本地凭据没有纳入仓库。
+整理原则：原始目录中的大体积中间数据、模型输入输出、缓存、IDE 状态和本地凭据没有纳入仓库。
 
 ## What this code does
 
 从脚本结构看，这套代码围绕 NEE、GPP 和 RECO 三个碳通量变量展开。核心建模部分使用 TensorFlow/Keras 的 CNN/Transformer 类模型，并与 Random Forest、XGBoost 等基线模型比较。物理约束主要体现在自定义损失函数和验证脚本中，通过约束 `NEE + GPP - RECO` 的残差来比较带物理约束和不带物理约束的预测结果。
 
-整体流程大致是：
+整体流程：
 
 1. 下载和裁剪 HLS、MODIS/VIIRS、Sentinel、ERA5-Land 等遥感和气象数据。
 2. 对站点、影像、LAI/FPAR、反射率和气象变量进行时空匹配、插值、质量标记和块级预处理。
@@ -37,7 +37,7 @@ NEE + GPP - RECO ~= 0
 
 ## Data and files not included
 
-以下内容保留在原始工作目录中，没有复制到 GitHub 项目：
+以下内容保留在原始工作目录中：
 
 - `data/` 目录下的 `.npy` 模型输入、站点结果和预测输出。
 - 大体积 GeoTIFF、中间影像、压缩包和运行产物。
